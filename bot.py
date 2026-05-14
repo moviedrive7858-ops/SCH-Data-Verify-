@@ -30,11 +30,12 @@ try:
 except Exception as e:
     logger.error(f"Failed to load Google Sheet data: {e}")
 
-# State management for each user
+# State management for each user (keyed by user_id – each user has independent state)
 user_states = {}
 
-# Pagination size
-PAGE_SIZE = 8
+# Pagination sizes
+PAGE_SIZE = 8           # Default for Township, RHC
+PAGE_SIZE_SMALL = 5     # For Sub-center and Village lists
 
 # Timeout for message auto-deletion (in seconds)
 MESSAGE_TIMEOUT = 120
@@ -47,11 +48,16 @@ SUBCENTER_SELECT = "subcenter_select"
 VILLAGE_SELECT = "village_select"
 MONTH_SELECT = "month_select"
 YEARLY_TOTAL_SELECT = "yearly_total_select"
+TOWNSHIP_STOCK_SELECT = "township_stock_select"
+TOWNSHIP_TESTING_SELECT = "township_team_testing_select"
 DISPLAY_PROFILE = "display_profile_data"
 DISPLAY_MONTHLY = "display_monthly_data"
 DISPLAY_YEARLY = "display_yearly_total"
+DISPLAY_TOWNSHIP_STOCK = "display_township_stock"
+DISPLAY_TOWNSHIP_TESTING = "display_township_team_testing"
 BACK = "back"
 PAGE = "page"
+CLOSE = "close"
 
 MONTHS = [
     "January", "February", "March", "April", "May", "June",
@@ -82,10 +88,10 @@ async def check_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("⚠️ Google Sheet data မရနိုင်သေးပါ။ ခဏစောင့်ပေးပါ။")
         return
 
-    # Clean previous session
+    # Clean previous session for THIS user only
     await _cleanup_old_message(context, user_id, chat_id)
 
-    # Initialize user state
+    # Initialize user state (independent per user)
     user_states[user_id] = {
         "history": [],
         "level": SHEET_SELECT,
@@ -96,6 +102,7 @@ async def check_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "village": None,
         "month": None,
         "page": 0,
+        "chat_id": chat_id,
     }
 
     text, kb = _build_sheet_select()
@@ -121,6 +128,17 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     parts = query.data.split(":", 1)
     action = parts[0]
     value = parts[1] if len(parts) > 1 else None
+
+    # ── Close ──
+    if action == CLOSE:
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        _remove_scheduled(context, user_id)
+        if user_id in user_states:
+            del user_states[user_id]
+        return
 
     # ── Pagination ──
     if action == PAGE:
@@ -200,6 +218,10 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         state["level"] = DISPLAY_MONTHLY
     elif action == YEARLY_TOTAL_SELECT:
         state["level"] = DISPLAY_YEARLY
+    elif action == TOWNSHIP_STOCK_SELECT:
+        state["level"] = DISPLAY_TOWNSHIP_STOCK
+    elif action == TOWNSHIP_TESTING_SELECT:
+        state["level"] = DISPLAY_TOWNSHIP_TESTING
 
     text, kb = _build_level(state)
     try:
@@ -231,6 +253,10 @@ def _build_level(state):
         return _build_monthly_data(state)
     elif level == DISPLAY_YEARLY:
         return _build_yearly_data(state)
+    elif level == DISPLAY_TOWNSHIP_STOCK:
+        return _build_township_stock_data(state)
+    elif level == DISPLAY_TOWNSHIP_TESTING:
+        return _build_township_team_testing_data(state)
     return "❌ Unknown level", InlineKeyboardMarkup([])
 
 
@@ -248,7 +274,7 @@ def _build_township(state):
     sheet = state["sheet"]
     townships = gsheet_data.get_townships(sheet)
     text = f"📊 <b>{sheet}</b>\n\n🏙 Township ရွေးချယ်ပါ:"
-    kb = _paginated_buttons(townships, TOWNSHIP_SELECT, state["page"], state["level"])
+    kb = _paginated_buttons(townships, TOWNSHIP_SELECT, state["page"], state["level"], PAGE_SIZE)
     return text, kb
 
 
@@ -257,7 +283,7 @@ def _build_rhc(state):
     twp = state["township"]
     rhcs = gsheet_data.get_rhcs(sheet, twp)
     text = f"📊 <b>{sheet}</b>\n🏙 Township: <b>{twp}</b>\n\n🏥 RHC ရွေးချယ်ပါ:"
-    kb = _paginated_buttons(rhcs, RHC_SELECT, state["page"], state["level"])
+    kb = _paginated_buttons(rhcs, RHC_SELECT, state["page"], state["level"], PAGE_SIZE)
     return text, kb
 
 
@@ -272,7 +298,7 @@ def _build_subcenter(state):
         f"🏥 RHC: <b>{rhc}</b>\n\n"
         "🏘 Sub-center ရွေးချယ်ပါ:"
     )
-    kb = _paginated_buttons(subs, SUBCENTER_SELECT, state["page"], state["level"])
+    kb = _paginated_buttons(subs, SUBCENTER_SELECT, state["page"], state["level"], PAGE_SIZE_SMALL)
     return text, kb
 
 
@@ -289,7 +315,7 @@ def _build_village(state):
         f"🏘 Sub-center: <b>{sub}</b>\n\n"
         "🏡 Village ရွေးချယ်ပါ:"
     )
-    kb = _paginated_buttons(villages, VILLAGE_SELECT, state["page"], state["level"])
+    kb = _paginated_buttons(villages, VILLAGE_SELECT, state["page"], state["level"], PAGE_SIZE_SMALL)
     return text, kb
 
 
@@ -311,8 +337,15 @@ def _build_month(state):
     if row:
         keyboard.append(row)
 
+    # Stock sheet: Township Stock button
+    if sheet == "Stock":
+        keyboard.append([InlineKeyboardButton("🏙 Township Stock", callback_data=TOWNSHIP_STOCK_SELECT)])
+
+    # Testing sheet: Yearly Total + Township Team Testing buttons
     if sheet == "Testing":
         keyboard.append([InlineKeyboardButton("📊 Yearly Total", callback_data=YEARLY_TOTAL_SELECT)])
+        keyboard.append([InlineKeyboardButton("🏙 Township Team Testing", callback_data=TOWNSHIP_TESTING_SELECT)])
+
     keyboard.append([InlineKeyboardButton("🔙 Back", callback_data=BACK)])
     return text, InlineKeyboardMarkup(keyboard)
 
@@ -334,7 +367,10 @@ def _build_profile_data(state):
     text += f"📍 Lat: <b>{data.get('Latitude', 'N/A')}</b>\n"
     text += f"📍 Long: <b>{data.get('Longitude', 'N/A')}</b>\n"
 
-    keyboard = [[InlineKeyboardButton("🔙 Back", callback_data=BACK)]]
+    keyboard = [
+        [InlineKeyboardButton("🔙 Back", callback_data=BACK)],
+        [InlineKeyboardButton("❌ Close", callback_data=CLOSE)],
+    ]
     return text, InlineKeyboardMarkup(keyboard)
 
 
@@ -367,7 +403,10 @@ def _build_monthly_data(state):
     except Exception:
         text = "⚠️ Data ရယူ၍မရပါ။"
 
-    keyboard = [[InlineKeyboardButton("🔙 Back", callback_data=BACK)]]
+    keyboard = [
+        [InlineKeyboardButton("🔙 Back", callback_data=BACK)],
+        [InlineKeyboardButton("❌ Close", callback_data=CLOSE)],
+    ]
     return text, InlineKeyboardMarkup(keyboard)
 
 
@@ -388,16 +427,128 @@ def _build_yearly_data(state):
     text += f"✅ NTG: <b>{data.get('NTG', '-')}</b>\n"
     text += f"🔄 Refer: <b>{data.get('Refer', '-')}</b>\n"
 
-    keyboard = [[InlineKeyboardButton("🔙 Back", callback_data=BACK)]]
+    keyboard = [
+        [InlineKeyboardButton("🔙 Back", callback_data=BACK)],
+        [InlineKeyboardButton("❌ Close", callback_data=CLOSE)],
+    ]
+    return text, InlineKeyboardMarkup(keyboard)
+
+
+def _build_township_stock_data(state):
+    """Display Township Stock totals – sums RDT/ACT/CQ/PQ across all villages in the township for each month."""
+    township = state["township"]
+    text = f"🏙 <b>Township Stock</b>\n🏙 Township: <b>{township}</b>\n\n"
+
+    try:
+        rows = [r for r in gsheet_data.stock_rows if r.get("Township") == township]
+        if not rows:
+            text += "⚠️ Data မရှိပါ။"
+        else:
+            for month in MONTHS:
+                totals = {"RDT": 0, "ACT": 0, "CQ": 0, "PQ": 0}
+                has_data = False
+                for r in rows:
+                    raw = r["_raw"]
+                    for sub in totals:
+                        col_idx = gsheet_data.stock_months.get((month, sub))
+                        if col_idx is not None and col_idx < len(raw):
+                            val = raw[col_idx].strip()
+                            if val:
+                                try:
+                                    totals[sub] += int(val)
+                                    has_data = True
+                                except ValueError:
+                                    pass
+                if has_data:
+                    text += (
+                        f"📅 <b>{month}</b>: "
+                        f"RDT={totals['RDT']}, ACT={totals['ACT']}, "
+                        f"CQ={totals['CQ']}, PQ={totals['PQ']}\n"
+                    )
+    except Exception:
+        text += "⚠️ Data ရယူ၍မရပါ။"
+
+    keyboard = [
+        [InlineKeyboardButton("🔙 Back", callback_data=BACK)],
+        [InlineKeyboardButton("❌ Close", callback_data=CLOSE)],
+    ]
+    return text, InlineKeyboardMarkup(keyboard)
+
+
+def _build_township_team_testing_data(state):
+    """Display Township Team Testing totals – sums Testing/Pf/Pv/Mix/NTG/Refer across all villages in the township for each month."""
+    township = state["township"]
+    text = f"🏙 <b>Township Team Testing</b>\n🏙 Township: <b>{township}</b>\n\n"
+
+    try:
+        rows = [r for r in gsheet_data.testing_rows if r.get("Township") == township]
+        if not rows:
+            text += "⚠️ Data မရှိပါ။"
+        else:
+            subs = ["Testing", "Pf", "Pv", "Mix", "NTG", "Refer"]
+            for month in MONTHS:
+                totals = {s: 0 for s in subs}
+                has_data = False
+                for r in rows:
+                    raw = r["_raw"]
+                    for sub in subs:
+                        col_idx = gsheet_data.testing_months.get((month, sub))
+                        if col_idx is not None and col_idx < len(raw):
+                            val = raw[col_idx].strip()
+                            if val:
+                                try:
+                                    totals[sub] += int(val)
+                                    has_data = True
+                                except ValueError:
+                                    pass
+                if has_data:
+                    text += (
+                        f"📅 <b>{month}</b>: "
+                        f"Testing={totals['Testing']}, Pf={totals['Pf']}, "
+                        f"Pv={totals['Pv']}, Mix={totals['Mix']}, "
+                        f"NTG={totals['NTG']}, Refer={totals['Refer']}\n"
+                    )
+
+            # Yearly Total
+            yearly_totals = {s: 0 for s in subs}
+            yearly_has = False
+            for r in rows:
+                raw = r["_raw"]
+                for sub in subs:
+                    col_idx = gsheet_data.testing_months.get(("Yearly Total", sub))
+                    if col_idx is not None and col_idx < len(raw):
+                        val = raw[col_idx].strip()
+                        if val:
+                            try:
+                                yearly_totals[sub] += int(val)
+                                yearly_has = True
+                            except ValueError:
+                                pass
+            if yearly_has:
+                text += (
+                    f"\n📊 <b>Yearly Total</b>: "
+                    f"Testing={yearly_totals['Testing']}, Pf={yearly_totals['Pf']}, "
+                    f"Pv={yearly_totals['Pv']}, Mix={yearly_totals['Mix']}, "
+                    f"NTG={yearly_totals['NTG']}, Refer={yearly_totals['Refer']}\n"
+                )
+    except Exception:
+        text += "⚠️ Data ရယူ၍မရပါ။"
+
+    keyboard = [
+        [InlineKeyboardButton("🔙 Back", callback_data=BACK)],
+        [InlineKeyboardButton("❌ Close", callback_data=CLOSE)],
+    ]
     return text, InlineKeyboardMarkup(keyboard)
 
 
 # ─── PAGINATION HELPER ──────────────────────────────────────
 
-def _paginated_buttons(items, action_prefix, page, current_level):
-    start = page * PAGE_SIZE
-    end = start + PAGE_SIZE
+def _paginated_buttons(items, action_prefix, page, current_level, page_size=PAGE_SIZE):
+    start = page * page_size
+    end = start + page_size
     page_items = items[start:end]
+    total_pages = max(1, (len(items) + page_size - 1) // page_size)
+    current_page_num = page + 1
 
     keyboard = [[InlineKeyboardButton(item, callback_data=f"{action_prefix}:{item}")] for item in page_items]
 
@@ -408,6 +559,10 @@ def _paginated_buttons(items, action_prefix, page, current_level):
         nav_row.append(InlineKeyboardButton("Next ➡️", callback_data=f"{PAGE}:{page + 1}:{current_level}"))
     if nav_row:
         keyboard.append(nav_row)
+
+    # Show page indicator if there are multiple pages
+    if total_pages > 1:
+        keyboard.append([InlineKeyboardButton(f"📄 {current_page_num}/{total_pages}", callback_data="noop")])
 
     keyboard.append([InlineKeyboardButton("🔙 Back", callback_data=BACK)])
     return InlineKeyboardMarkup(keyboard)
@@ -472,6 +627,14 @@ async def _cleanup_old_message(context, user_id, chat_id):
         _remove_scheduled(context, user_id)
 
 
+# ─── NOOP HANDLER (for page indicator button) ───────────────
+
+async def noop_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle noop callback data – does nothing, just answers the callback."""
+    query = update.callback_query
+    await query.answer()
+
+
 # ─── ERROR HANDLER ──────────────────────────────────────────
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -486,6 +649,8 @@ def main() -> None:
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("check_data", check_data))
+    # Handle noop callback (page indicator) separately so it doesn't go through button()
+    application.add_handler(CallbackQueryHandler(noop_handler, pattern="^noop$"))
     application.add_handler(CallbackQueryHandler(button))
 
     # Register error handler to suppress noisy tracebacks in logs
