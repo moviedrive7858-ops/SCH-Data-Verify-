@@ -416,6 +416,10 @@ def _paginated_buttons(items, action_prefix, page, current_level):
 # ─── AUTO-DELETE / SCHEDULING ───────────────────────────────
 
 def _schedule_deletion(context, chat_id, message_id, user_id):
+    """Schedule auto-deletion of a message. Safely skips if job_queue is not available."""
+    if context.job_queue is None:
+        logger.warning("job_queue is None – auto-delete scheduling skipped.")
+        return
     job_name = f"del_{user_id}"
     context.job_queue.run_once(
         _delete_callback,
@@ -426,6 +430,10 @@ def _schedule_deletion(context, chat_id, message_id, user_id):
 
 
 def _remove_scheduled(context, user_id):
+    """Remove any pending auto-delete job. Safely skips if job_queue is not available."""
+    if context.job_queue is None:
+        logger.warning("job_queue is None – scheduled job removal skipped.")
+        return
     job_name = f"del_{user_id}"
     jobs = context.job_queue.get_jobs_by_name(job_name)
     for job in jobs:
@@ -464,6 +472,13 @@ async def _cleanup_old_message(context, user_id, chat_id):
         _remove_scheduled(context, user_id)
 
 
+# ─── ERROR HANDLER ──────────────────────────────────────────
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log errors and prevent unhandled exception noise in logs."""
+    logger.error("Exception while handling an update:", exc_info=context.error)
+
+
 # ─── MAIN ───────────────────────────────────────────────────
 
 def main() -> None:
@@ -472,6 +487,9 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("check_data", check_data))
     application.add_handler(CallbackQueryHandler(button))
+
+    # Register error handler to suppress noisy tracebacks in logs
+    application.add_error_handler(error_handler)
 
     # Start keep_alive for Render
     try:
