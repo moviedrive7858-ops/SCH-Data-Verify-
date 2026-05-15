@@ -337,14 +337,14 @@ def _build_month(state):
     if row:
         keyboard.append(row)
 
-    # Stock sheet: Township Stock button
+    # Stock sheet: Township Stock dashboard button
     if sheet == "Stock":
-        keyboard.append([InlineKeyboardButton("🏙 Township Stock", callback_data=TOWNSHIP_STOCK_SELECT)])
+        keyboard.append([InlineKeyboardButton("🏙 Township Stock Dashboard", callback_data=TOWNSHIP_STOCK_SELECT)])
 
-    # Testing sheet: Yearly Total + Township Team Testing buttons
+    # Testing sheet: Yearly Total + Township Team Testing dashboard buttons
     if sheet == "Testing":
         keyboard.append([InlineKeyboardButton("📊 Yearly Total", callback_data=YEARLY_TOTAL_SELECT)])
-        keyboard.append([InlineKeyboardButton("🏙 Township Team Testing", callback_data=TOWNSHIP_TESTING_SELECT)])
+        keyboard.append([InlineKeyboardButton("🏙 Township Team Testing Dashboard", callback_data=TOWNSHIP_TESTING_SELECT)])
 
     keyboard.append([InlineKeyboardButton("🔙 Back", callback_data=BACK)])
     return text, InlineKeyboardMarkup(keyboard)
@@ -434,39 +434,33 @@ def _build_yearly_data(state):
     return text, InlineKeyboardMarkup(keyboard)
 
 
+# ─── TOWNSHIP STOCK DASHBOARD ────────────────────────────────
+
 def _build_township_stock_data(state):
-    """Display Township Stock totals – sums RDT/ACT/CQ/PQ across all villages in the township for each month."""
     township = state["township"]
-    text = f"🏙 <b>Township Stock</b>\n🏙 Township: <b>{township}</b>\n\n"
 
     try:
-        rows = [r for r in gsheet_data.stock_rows if r.get("Township") == township]
-        if not rows:
-            text += "⚠️ Data မရှိပါ။"
-        else:
-            for month in MONTHS:
-                totals = {"RDT": 0, "ACT": 0, "CQ": 0, "PQ": 0}
-                has_data = False
-                for r in rows:
-                    raw = r["_raw"]
-                    for sub in totals:
-                        col_idx = gsheet_data.stock_months.get((month, sub))
-                        if col_idx is not None and col_idx < len(raw):
-                            val = raw[col_idx].strip()
-                            if val:
-                                try:
-                                    totals[sub] += int(val)
-                                    has_data = True
-                                except ValueError:
-                                    pass
-                if has_data:
-                    text += (
-                        f"📅 <b>{month}</b>: "
-                        f"RDT={totals['RDT']}, ACT={totals['ACT']}, "
-                        f"CQ={totals['CQ']}, PQ={totals['PQ']}\n"
-                    )
+        monthly_data, village_count = gsheet_data.get_township_stock_totals(township)
     except Exception:
-        text += "⚠️ Data ရယူ၍မရပါ။"
+        monthly_data, village_count = {}, 0
+
+    text = (
+        f"🏙 <b>Township Stock Dashboard</b>\n"
+        f"📍 Township: <b>{township}</b>\n"
+        f"🏡 စုစုပေါင်း ရွာအရေအတွက်: <b>{village_count}</b>\n\n"
+    )
+
+    if not monthly_data:
+        text += "⚠️ Data မရှိပါ။"
+    else:
+        for month in MONTHS:
+            if month in monthly_data:
+                d = monthly_data[month]
+                text += (
+                    f"📅 <b>{month}</b>\n"
+                    f"    🔬 RDT: <b>{d['RDT']}</b>  |  💊 ACT: <b>{d['ACT']}</b>\n"
+                    f"    💊 CQ: <b>{d['CQ']}</b>  |  💊 PQ: <b>{d['PQ']}</b>\n"
+                )
 
     keyboard = [
         [InlineKeyboardButton("🔙 Back", callback_data=BACK)],
@@ -475,64 +469,42 @@ def _build_township_stock_data(state):
     return text, InlineKeyboardMarkup(keyboard)
 
 
+# ─── TOWNSHIP TEAM TESTING DASHBOARD ─────────────────────────
+
 def _build_township_team_testing_data(state):
-    """Display Township Team Testing totals – sums Testing/Pf/Pv/Mix/NTG/Refer across all villages in the township for each month."""
     township = state["township"]
-    text = f"🏙 <b>Township Team Testing</b>\n🏙 Township: <b>{township}</b>\n\n"
 
     try:
-        rows = [r for r in gsheet_data.testing_rows if r.get("Township") == township]
-        if not rows:
-            text += "⚠️ Data မရှိပါ။"
-        else:
-            subs = ["Testing", "Pf", "Pv", "Mix", "NTG", "Refer"]
-            for month in MONTHS:
-                totals = {s: 0 for s in subs}
-                has_data = False
-                for r in rows:
-                    raw = r["_raw"]
-                    for sub in subs:
-                        col_idx = gsheet_data.testing_months.get((month, sub))
-                        if col_idx is not None and col_idx < len(raw):
-                            val = raw[col_idx].strip()
-                            if val:
-                                try:
-                                    totals[sub] += int(val)
-                                    has_data = True
-                                except ValueError:
-                                    pass
-                if has_data:
-                    text += (
-                        f"📅 <b>{month}</b>: "
-                        f"Testing={totals['Testing']}, Pf={totals['Pf']}, "
-                        f"Pv={totals['Pv']}, Mix={totals['Mix']}, "
-                        f"NTG={totals['NTG']}, Refer={totals['Refer']}\n"
-                    )
-
-            # Yearly Total
-            yearly_totals = {s: 0 for s in subs}
-            yearly_has = False
-            for r in rows:
-                raw = r["_raw"]
-                for sub in subs:
-                    col_idx = gsheet_data.testing_months.get(("Yearly Total", sub))
-                    if col_idx is not None and col_idx < len(raw):
-                        val = raw[col_idx].strip()
-                        if val:
-                            try:
-                                yearly_totals[sub] += int(val)
-                                yearly_has = True
-                            except ValueError:
-                                pass
-            if yearly_has:
-                text += (
-                    f"\n📊 <b>Yearly Total</b>: "
-                    f"Testing={yearly_totals['Testing']}, Pf={yearly_totals['Pf']}, "
-                    f"Pv={yearly_totals['Pv']}, Mix={yearly_totals['Mix']}, "
-                    f"NTG={yearly_totals['NTG']}, Refer={yearly_totals['Refer']}\n"
-                )
+        monthly_data, yearly_totals, village_count = gsheet_data.get_township_testing_totals(township)
     except Exception:
-        text += "⚠️ Data ရယူ၍မရပါ။"
+        monthly_data, yearly_totals, village_count = {}, None, 0
+
+    text = (
+        f"🏙 <b>Township Team Testing Dashboard</b>\n"
+        f"📍 Township: <b>{township}</b>\n"
+        f"🏡 စုစုပေါင်း ရွာအရေအတွက်: <b>{village_count}</b>\n\n"
+    )
+
+    if not monthly_data and not yearly_totals:
+        text += "⚠️ Data မရှိပါ။"
+    else:
+        for month in MONTHS:
+            if month in monthly_data:
+                d = monthly_data[month]
+                text += (
+                    f"📅 <b>{month}</b>\n"
+                    f"    🔬 Testing: <b>{d['Testing']}</b>  |  🦟 Pf: <b>{d['Pf']}</b>\n"
+                    f"    🦟 Pv: <b>{d['Pv']}</b>  |  🦟 Mix: <b>{d['Mix']}</b>\n"
+                    f"    ✅ NTG: <b>{d['NTG']}</b>  |  🔄 Refer: <b>{d['Refer']}</b>\n"
+                )
+
+        if yearly_totals:
+            text += (
+                f"\n📊 <b>Yearly Total</b>\n"
+                f"    🔬 Testing: <b>{yearly_totals['Testing']}</b>  |  🦟 Pf: <b>{yearly_totals['Pf']}</b>\n"
+                f"    🦟 Pv: <b>{yearly_totals['Pv']}</b>  |  🦟 Mix: <b>{yearly_totals['Mix']}</b>\n"
+                f"    ✅ NTG: <b>{yearly_totals['NTG']}</b>  |  🔄 Refer: <b>{yearly_totals['Refer']}</b>\n"
+            )
 
     keyboard = [
         [InlineKeyboardButton("🔙 Back", callback_data=BACK)],
@@ -649,11 +621,11 @@ def main() -> None:
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("check_data", check_data))
-    # Handle noop callback (page indicator) separately so it doesn't go through button()
+    # Handle noop callback (page indicator) separately
     application.add_handler(CallbackQueryHandler(noop_handler, pattern="^noop$"))
     application.add_handler(CallbackQueryHandler(button))
 
-    # Register error handler to suppress noisy tracebacks in logs
+    # Register error handler
     application.add_error_handler(error_handler)
 
     # Start keep_alive for Render
