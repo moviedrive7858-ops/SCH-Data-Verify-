@@ -2,6 +2,8 @@ import gspread
 import json
 import os
 import logging
+import threading
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -9,19 +11,23 @@ logger = logging.getLogger(__name__)
 class GSheetData:
     def __init__(self):
         self.gc = self._authenticate()
-        url = os.environ.get(
+        self.url = os.environ.get(
             "GOOGLE_SPREADSHEET_URL",
             "https://docs.google.com/spreadsheets/d/1Q281_R_MrEhEIg1PpeXbYgXTakNjrkTFVDhuZbmdLJk/edit?usp=drive_link"
         )
-        self.spreadsheet = self.gc.open_by_url(url)
+        self.spreadsheet = self.gc.open_by_url(self.url)
+
+        # Lock for thread-safe data access
+        self._lock = threading.Lock()
 
         # Load all sheet data into memory
-        self.profile_rows = self._load_sheet("Profile")
-        self.stock_rows, self.stock_months = self._load_monthly_sheet("Stock", sub_headers=["RDT", "ACT", "CQ", "PQ"])
-        self.testing_rows, self.testing_months = self._load_monthly_sheet(
-            "Testing", sub_headers=["Testing", "Pf", "Pv", "Mix", "NTG", "Refer"]
-        )
-        logger.info(f"Loaded: Profile={len(self.profile_rows)}, Stock={len(self.stock_rows)}, Testing={len(self.testing_rows)} rows")
+        self._load_all_data()
+
+        # Start auto-refresh background thread (every 15 minutes)
+        self._refresh_interval = 15 * 60  # 15 minutes in seconds
+        self._refresh_thread = threading.Thread(target=self._auto_refresh_loop, daemon=True)
+        self._refresh_thread.start()
+        logger.info("Auto-refresh started (every 15 minutes).")
 
     # ─── AUTH ────────────────────────────────────────────────
 
@@ -34,6 +40,44 @@ class GSheetData:
             return gspread.service_account(filename=tmp_path)
         else:
             return gspread.service_account()
+
+    # ─── LOAD ALL DATA ──────────────────────────────────────
+
+    def _load_all_data(self):
+        """Load all sheets into memory (thread-safe)."""
+        profile_rows = self._load_sheet("Profile")
+        stock_rows, stock_months = self._load_monthly_sheet("Stock", sub_headers=["RDT", "ACT", "CQ", "PQ"])
+        testing_rows, testing_months = self._load_monthly_sheet(
+            "Testing", sub_headers=["Testing", "Pf", "Pv", "Mix", "NTG", "Refer"]
+        )
+
+        with self._lock:
+            self.profile_rows = profile_rows
+            self.stock_rows = stock_rows
+            self.stock_months = stock_months
+            self.testing_rows = testing_rows
+            self.testing_months = testing_months
+
+        logger.info(
+            f"Loaded: Profile={len(profile_rows)}, "
+            f"Stock={len(stock_rows)}, Testing={len(testing_rows)} rows"
+        )
+
+    # ─── AUTO REFRESH ───────────────────────────────────────
+
+    def _auto_refresh_loop(self):
+        """Background thread that reloads data every 15 minutes."""
+        while True:
+            time.sleep(self._refresh_interval)
+            try:
+                logger.info("Auto-refresh: reloading Google Sheet data...")
+                # Re-authenticate in case token expired
+                self.gc = self._authenticate()
+                self.spreadsheet = self.gc.open_by_url(self.url)
+                self._load_all_data()
+                logger.info("Auto-refresh: data reloaded successfully.")
+            except Exception as e:
+                logger.error(f"Auto-refresh failed: {e}")
 
     # ─── LOAD SHEETS ────────────────────────────────────────
 
@@ -79,7 +123,6 @@ class GSheetData:
         for col_idx in range(4, len(header1)):
             h1 = header1[col_idx].strip()
             h2 = header2[col_idx].strip() if col_idx < len(header2) else ""
-
             if h1 and h1 in months_list:
                 current_month = h1
             if current_month and h2:
@@ -95,7 +138,6 @@ class GSheetData:
                 "_raw": row,
             }
             rows.append(record)
-
         return rows, month_map
 
     # ─── GETTERS ─────────────────────────────────────────────
@@ -104,12 +146,13 @@ class GSheetData:
         return ["Profile", "Stock", "Testing"]
 
     def _get_rows(self, sheet_name):
-        if sheet_name == "Profile":
-            return self.profile_rows
-        elif sheet_name == "Stock":
-            return self.stock_rows
-        elif sheet_name == "Testing":
-            return self.testing_rows
+        with self._lock:
+            if sheet_name == "Profile":
+                return list(self.profile_rows)
+            elif sheet_name == "Stock":
+                return list(self.stock_rows)
+            elif sheet_name == "Testing":
+                return list(self.testing_rows)
         return []
 
     def get_townships(self, sheet_name):
@@ -173,7 +216,8 @@ class GSheetData:
     # ─── PROFILE DATA ───────────────────────────────────────
 
     def get_profile_data(self, township, rhc, subcenter, village):
-        row = self._find_row(self.profile_rows, township, rhc, subcenter, village)
+        with self._lock:
+            row = self._find_row(self.profile_rows, township, rhc, subcenter, village)
         if not row:
             return {}
 
@@ -190,14 +234,16 @@ class GSheetData:
     # ─── STOCK DATA ──────────────────────────────────────────
 
     def get_stock_data(self, township, rhc, subcenter, village, month):
-        row = self._find_row(self.stock_rows, township, rhc, subcenter, village)
+        with self._lock:
+            row = self._find_row(self.stock_rows, township, rhc, subcenter, village)
+            stock_months = dict(self.stock_months)
         if not row:
             return {}
 
         raw = row["_raw"]
         result = {}
         for sub in ["RDT", "ACT", "CQ", "PQ"]:
-            col_idx = self.stock_months.get((month, sub))
+            col_idx = stock_months.get((month, sub))
             if col_idx is not None and col_idx < len(raw):
                 val = raw[col_idx].strip()
                 result[sub] = val if val else "-"
@@ -208,14 +254,16 @@ class GSheetData:
     # ─── TESTING DATA ────────────────────────────────────────
 
     def get_testing_data(self, township, rhc, subcenter, village, month):
-        row = self._find_row(self.testing_rows, township, rhc, subcenter, village)
+        with self._lock:
+            row = self._find_row(self.testing_rows, township, rhc, subcenter, village)
+            testing_months = dict(self.testing_months)
         if not row:
             return {}
 
         raw = row["_raw"]
         result = {}
         for sub in ["Testing", "Pf", "Pv", "Mix", "NTG", "Refer"]:
-            col_idx = self.testing_months.get((month, sub))
+            col_idx = testing_months.get((month, sub))
             if col_idx is not None and col_idx < len(raw):
                 val = raw[col_idx].strip()
                 result[sub] = val if val else "-"
@@ -224,17 +272,111 @@ class GSheetData:
         return result
 
     def get_testing_yearly_total(self, township, rhc, subcenter, village):
-        row = self._find_row(self.testing_rows, township, rhc, subcenter, village)
+        with self._lock:
+            row = self._find_row(self.testing_rows, township, rhc, subcenter, village)
+            testing_months = dict(self.testing_months)
         if not row:
             return {}
 
         raw = row["_raw"]
         result = {}
         for sub in ["Testing", "Pf", "Pv", "Mix", "NTG", "Refer"]:
-            col_idx = self.testing_months.get(("Yearly Total", sub))
+            col_idx = testing_months.get(("Yearly Total", sub))
             if col_idx is not None and col_idx < len(raw):
                 val = raw[col_idx].strip()
                 result[sub] = val if val else "-"
             else:
                 result[sub] = "-"
         return result
+
+    # ─── TOWNSHIP STOCK DASHBOARD ────────────────────────────
+
+    def get_township_stock_totals(self, township):
+        """
+        Sum RDT/ACT/CQ/PQ for all villages in a township, grouped by month.
+        Returns: (monthly_data dict, village_count)
+        """
+        with self._lock:
+            rows = [r for r in self.stock_rows if r.get("Township") == township]
+            stock_months = dict(self.stock_months)
+
+        months = [
+            "January", "February", "March", "April", "May", "June",
+            "July", "August", "September", "October", "November", "December"
+        ]
+        subs = ["RDT", "ACT", "CQ", "PQ"]
+        result = {}
+
+        for month in months:
+            totals = {s: 0 for s in subs}
+            has_data = False
+            for r in rows:
+                raw = r["_raw"]
+                for sub in subs:
+                    col_idx = stock_months.get((month, sub))
+                    if col_idx is not None and col_idx < len(raw):
+                        val = raw[col_idx].strip()
+                        if val:
+                            try:
+                                totals[sub] += int(val)
+                                has_data = True
+                            except ValueError:
+                                pass
+            if has_data:
+                result[month] = totals
+
+        return result, len(rows)
+
+    # ─── TOWNSHIP TEAM TESTING DASHBOARD ─────────────────────
+
+    def get_township_testing_totals(self, township):
+        """
+        Sum Testing/Pf/Pv/Mix/NTG/Refer for all villages in a township, grouped by month.
+        Returns: (monthly_data dict, yearly_totals or None, village_count)
+        """
+        with self._lock:
+            rows = [r for r in self.testing_rows if r.get("Township") == township]
+            testing_months = dict(self.testing_months)
+
+        months = [
+            "January", "February", "March", "April", "May", "June",
+            "July", "August", "September", "October", "November", "December"
+        ]
+        subs = ["Testing", "Pf", "Pv", "Mix", "NTG", "Refer"]
+        result = {}
+
+        for month in months:
+            totals = {s: 0 for s in subs}
+            has_data = False
+            for r in rows:
+                raw = r["_raw"]
+                for sub in subs:
+                    col_idx = testing_months.get((month, sub))
+                    if col_idx is not None and col_idx < len(raw):
+                        val = raw[col_idx].strip()
+                        if val:
+                            try:
+                                totals[sub] += int(val)
+                                has_data = True
+                            except ValueError:
+                                pass
+            if has_data:
+                result[month] = totals
+
+        # Yearly Total
+        yearly_totals = {s: 0 for s in subs}
+        yearly_has = False
+        for r in rows:
+            raw = r["_raw"]
+            for sub in subs:
+                col_idx = testing_months.get(("Yearly Total", sub))
+                if col_idx is not None and col_idx < len(raw):
+                    val = raw[col_idx].strip()
+                    if val:
+                        try:
+                            yearly_totals[sub] += int(val)
+                            yearly_has = True
+                        except ValueError:
+                            pass
+
+        return result, yearly_totals if yearly_has else None, len(rows)
